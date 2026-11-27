@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.BeforeEach;
@@ -146,6 +147,48 @@ public class DomainTypesIT extends AbstractRecordsProducerTest {
         Struct after = (Struct) ((Struct) record.value()).get("after");
 
         assertThat(after.get("dom_date")).isEqualTo(after.get("plain_ts"));
+    }
+
+    @Test
+    @FixFor("debezium/dbz#178")
+    public void shouldSnapshotAndStreamVarcharDomainWhenUnknownDatatypesDisabled() throws Exception {
+        TestHelper.execute(
+                "CREATE DOMAIN domaintypes.sf_id AS VARCHAR(18);",
+                "CREATE TABLE domaintypes.payment (id SERIAL PRIMARY KEY, salesforce_id domaintypes.sf_id);",
+                "INSERT INTO domaintypes.payment (salesforce_id) VALUES ('001xx000003DGbYAAW');");
+
+        start(PostgresConnector.class, TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "domaintypes")
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, "domaintypes.payment")
+                .with(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES, false)
+                .with("column.propagate.source.type", "domaintypes.payment.salesforce_id")
+                .build());
+        assertConnectorIsRunning();
+
+        final TestConsumer consumer = testConsumer(1, "domaintypes");
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+        assertPaymentDomainRecord(consumer.remove(), "001xx000003DGbYAAW");
+
+        waitForStreamingToStart();
+
+        TestHelper.execute("INSERT INTO domaintypes.payment (salesforce_id) VALUES ('001xx000003DGbZAAW');");
+        consumer.expects(1);
+        consumer.await(TestHelper.waitTimeForRecords() * 30, TimeUnit.SECONDS);
+        assertPaymentDomainRecord(consumer.remove(), "001xx000003DGbZAAW");
+        assertThat(consumer.isEmpty()).isTrue();
+    }
+
+    private void assertPaymentDomainRecord(SourceRecord record, String expectedValue) {
+        final Struct after = (Struct) ((Struct) record.value()).get("after");
+        final Field salesforceIdField = after.schema().field("salesforce_id");
+        assertThat(salesforceIdField).isNotNull();
+        assertThat(salesforceIdField.schema().type()).isEqualTo(Schema.Type.STRING);
+        assertThat(salesforceIdField.schema().isOptional()).isTrue();
+        assertThat(salesforceIdField.schema().parameters())
+                .containsEntry(TestHelper.TYPE_NAME_PARAMETER_KEY, "SF_ID")
+                .containsEntry(TestHelper.TYPE_LENGTH_PARAMETER_KEY, "18");
+        assertThat(after.get("salesforce_id")).isEqualTo(expectedValue);
     }
 
     private List<String> getFieldNames(Struct struct) {
